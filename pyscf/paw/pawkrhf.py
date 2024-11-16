@@ -168,12 +168,7 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
 
     return dHpsit_nG
 
-def Ht_example(wfs, u, ham, psit_nG = None, new=False, scalewithocc=True):
-    '''
-    Some example I found in GPAW of applying PAW hamiltonian to PW wfs:
-    H |psit_nG>. I have verified that this function give the same result
-    as the functions I implemented
-    '''
+def Ht_example(wfs, u, ham, psit_nG = None, calculate_P_ani=False, scalewithocc=True):
     kpt = wfs.kpt_u[u]
     psit_nG = psit_nG if psit_nG is not None else kpt.psit_nG
 
@@ -182,7 +177,7 @@ def Ht_example(wfs, u, ham, psit_nG = None, new=False, scalewithocc=True):
     wfs.apply_pseudo_hamiltonian(kpt, ham, psit_nG, Hpsi_nG)
 
     c_axi = {}
-    if new:
+    if calculate_P_ani:
         dH_asii = ham.potential.dH_asii
         for a, P_xi in kpt.P_ani.items():
             dH_ii = dH_asii[a][kpt.s]
@@ -230,7 +225,7 @@ def main():
     cell.verbose = 5
     cell.atom=pyscf_ase.ase_atoms_to_pyscf(ase_atom)
     cell.a=ase_atom.cell
-    cell.basis = 'gth-tzvp'     # TODO: import smooth Gaussian basis from DOI: 10.1039/d0cp05229a
+    cell.basis = 'gth-szv'     # TODO: import smooth Gaussian basis from DOI: 10.1039/d0cp05229a
     cell.pseudo = 'gth-pade'    # TODO: should not need this with PAW
     cell.build()
 
@@ -247,6 +242,18 @@ def main():
     calc = init_gpaw_calc(ase_atom, kpts, cell.nao, e_cut=350)
 
     pawkrhf = PAWKRHF(cell, calc, kpts)
+
+    print(pawkrhf.kernel())
+    print('Hooray')
+    # s1e = pawkrhf.get_ovlp()
+    # coords = pawkrhf.cell.gen_uniform_grids((200,200,200))
+    # GTO = pawkrhf.cell.pbc_eval_gto("GTOval_cart", coords, kpts=pawkrhf.kpts)[0]
+    # dv = pawkrhf.cell.vol / GTO.shape[0]
+    # norm = GTO.conj().T @ GTO * dv # GTO normalized to 1 within the UC
+    normG = pawkrhf.gto2pw[0][:, 0].conj().T @ pawkrhf.gto2pw[0][:, 0]
+    # this implies that the fourier coefficient normalize to 1/V
+
+    
     # pawkrhf.get_h_matrix()
 
     # psit_nG = pawkrhf.gto2pw[0].T.copy()
@@ -254,8 +261,6 @@ def main():
     # dHpsitng = apply_PAW_correction(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=False)
     # psit_nG2, Htpsitng1 = Ht_example(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG)
     # h = pawkrhf.get_h_matrix()
-    print(pawkrhf.kernel())
-    print('Hooray')
 
 
 class PAWKRHF(KRHF):
@@ -329,7 +334,7 @@ class PAWKRHF(KRHF):
             for j in range(nao):
                 ao_1d = GTOs[k][:, j]
                 ao_3d = ao_1d.reshape(mesh)
-                gto2pw_k[:, j] = self.calc.wfs.pd.fft(ao_3d, q=k) / ao_1d.shape[0]
+                gto2pw_k[:, j] = self.calc.wfs.pd.fft(ao_3d, q=k) / ao_1d.shape[0]*np.sqrt(self.cell.vol)
             self.gto2pw.append(gto2pw_k)
 
     # def GTO2PW(coeff, mat): 
@@ -376,9 +381,10 @@ class PAWKRHF(KRHF):
         # self.mo_occ is (kpt, nao) list of 1D array
         for k in len(self.mo_coeff):
             mo_coeff_pw = self.gto2pw @ self.mo_coeff[k]
-            ### TODO: make this work...
-            psit = kpt.psit.new(buf=psit_nG)
-            wfs.kpt_u[k].psit.array = mo_coeff_pw.T # this won't work
+            ###
+            kpt = wfs.kpt_u[k]
+            psit = kpt.psit.new(buf=mo_coeff_pw.T)
+            kpt.psit[:] = psit
             ####
             wfs.kpt_u[k].f_n = self.mo_occ[k] # aliasing?
 
@@ -399,7 +405,7 @@ class PAWKRHF(KRHF):
         # TODO: update calc hamiltonian
         calc = self.calc
         if cycle > 0:
-            self.update_calc(calc.wfs, calc.ham, calc.dens)
+            self.update_calc(calc.wfs, calc.hamiltonian, calc.dens)
         f_kpts = self.get_h_matrix()
         #################
 
