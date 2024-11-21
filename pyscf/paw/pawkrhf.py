@@ -4,6 +4,7 @@ import numpy as np
 
 from gpaw import GPAW, PW
 from gpaw.utilities import unpack_hermitian
+from gpaw.matrix import matrix_matrix_multiply as mmm
 
 from pyscf.pbc.scf.khf import KRHF
 
@@ -103,6 +104,8 @@ def apply_pseudo_hamiltonian(wfs, u, ham, psit_nG=None):
     kpt = wfs.kpt_u[u]
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
 
+    # nbands = wfs.bd.mynbands
+    # Htpsit_nG = wfs.empty(nbands, q=kpt.q)
     Htpsit_nG = np.zeros_like(psit_nG)
 
     # # compare gpaw and my implementation
@@ -164,9 +167,35 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
     for a, P_ni in P_ani.items():
         dH_ii = unpack_hermitian(ham.dH_asp[a][kpt.s])
         P_ani[a] = np.dot(P_ni, dH_ii)
+
     wfs.pt.add(dHpsit_nG, P_ani, kpt.q)
 
     return dHpsit_nG
+
+def mysterious_gpaw_H(ham, wfs, u, psit_nG):
+    kpt = wfs.kpt_u[u]
+    psit = kpt.psit
+
+    # update wfs
+    # tmp1 = psit.new(buf=psit_nG)
+    # psit[:] = tmp1
+
+    tmp = psit.new(buf=wfs.work_array)
+    H = wfs.work_matrix_nn
+    P2 = kpt.projections.new()
+
+    Ht = partial(wfs.apply_pseudo_hamiltonian, kpt, ham)
+
+    # We calculate the complex conjugate of H, because
+    # that is what is most efficient with BLAS given the layout of
+    # our matrices.
+    psit.matrix_elements(operator=Ht, result=tmp, out=H,
+                            symmetric=True, cc=True)
+    ham.dH(kpt.projections, out=P2)
+    mmm(1.0, kpt.projections, 'N', P2, 'C', 1.0, H, symmetric=True)
+    ham.xc.correct_hamiltonian_matrix(kpt, H.array)
+
+    return H.array
 
 def Ht_example(wfs, u, ham, psit_nG = None, calculate_P_ani=False, scalewithocc=True):
     kpt = wfs.kpt_u[u]
@@ -225,8 +254,8 @@ def main():
     cell.verbose = 5
     cell.atom=pyscf_ase.ase_atoms_to_pyscf(ase_atom)
     cell.a=ase_atom.cell
-    cell.basis = 'gth-szv'     # TODO: import smooth Gaussian basis from DOI: 10.1039/d0cp05229a
-    cell.pseudo = 'gth-pade'    # TODO: should not need this with PAW
+    cell.basis = 'gth-szx'     # TODO: import smooth Gaussian basis from DOI: 10.1039/d0cp05229a
+    cell.pseudo = 'gth-pade'   # TODO: should not need this with PAW
     cell.build()
 
     # Initialize kpoints
@@ -243,24 +272,27 @@ def main():
 
     pawkrhf = PAWKRHF(cell, calc, kpts)
 
-    print(pawkrhf.kernel())
-    print('Hooray')
-    # s1e = pawkrhf.get_ovlp()
-    # coords = pawkrhf.cell.gen_uniform_grids((200,200,200))
-    # GTO = pawkrhf.cell.pbc_eval_gto("GTOval_cart", coords, kpts=pawkrhf.kpts)[0]
-    # dv = pawkrhf.cell.vol / GTO.shape[0]
-    # norm = GTO.conj().T @ GTO * dv # GTO normalized to 1 within the UC
-    normG = pawkrhf.gto2pw[0][:, 0].conj().T @ pawkrhf.gto2pw[0][:, 0]
+    s1e = pawkrhf.get_ovlp()
+    coords = pawkrhf.cell.gen_uniform_grids((200,200,200))
+    GTO = pawkrhf.cell.pbc_eval_gto("GTOval_sph", coords, kpts=pawkrhf.kpts)[0]
+    dv = pawkrhf.cell.vol / GTO.shape[0]
+    norm = GTO.conj().T @ GTO * dv # GTO normalized to 1 within the UC
     # this implies that the fourier coefficient normalize to 1/V
-
-    
-    # pawkrhf.get_h_matrix()
+    # I made sure that the GTO's, in fourier representation also normalize to one.
+    normG = pawkrhf.gto2pw[0][:, 0].conj().T @ pawkrhf.gto2pw[0][:, 0]
 
     # psit_nG = pawkrhf.gto2pw[0].T.copy()
     # Htpsitng = apply_pseudo_hamiltonian(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG)
     # dHpsitng = apply_PAW_correction(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=False)
     # psit_nG2, Htpsitng1 = Ht_example(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG)
     # h = pawkrhf.get_h_matrix()
+    # h1 = pawkrhf.get_h_matrix_gpaw()
+
+    # Manual Initialization of dm now
+    dm0 = np.zeros((1,1,1))
+    dm0[0,0,0] = 2
+    print(pawkrhf.kernel(dm0=dm0))
+    print('Hooray')
 
 
 class PAWKRHF(KRHF):
@@ -326,6 +358,8 @@ class PAWKRHF(KRHF):
         mesh = self.calc.wfs.gd.N_c
         coords = self.cell.get_uniform_grids(mesh)
         GTOs = self.cell.pbc_eval_gto("GTOval_sph", coords, kpts=self.kpts)
+        # GTOs = [np.ones_like(GTOs[0])]
+        
 
         self.gto2pw = list()
         for k in range(len(self.kpts)):
@@ -351,14 +385,34 @@ class PAWKRHF(KRHF):
         nkpts = len(self.kpts)
         nao = self.cell.nao
         calc = self.calc
-        h = np.zeros((nkpts, nao, nao), dtype=np.complex128)
+        h = np.zeros((nkpts, nao, nao), dtype=np.float64)
 
         for k in range(nkpts):
+            # recall each column of gto2pw[k] is PW coefficient of AO, gto2pw[k].shape = (N_PW, nao)
             psit_nG = self.gto2pw[k].T.copy()
             Htpsit_nG = apply_pseudo_hamiltonian(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG).T
             dHpsit_nG = apply_PAW_correction(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=True).T
-            Hpsit_nG = Htpsit_nG + dHpsit_nG    # H |psit_nG>
-            h[k, :, :] = self.gto2pw[k].conj().T @ Hpsit_nG
+            Hpsit_nG = Htpsit_nG + dHpsit_nG    # H |psit_nG>.shape = (N_PW, nao)
+            
+            ###########################
+            # energy offset (very not sure about this)
+            # I assume GPAW calculates E = E_total - E_ref
+            # So I did the following correction 
+            # <psit_n | Fock | psit_m> = <psit_n | H | psit_m> + E_ref / N
+            # The following is taken from gpaw documentation:
+            '''
+            The GPAW code calculates energies relative to the energy
+            of separated reference atoms, where each atom is in a spin-paired, 
+            neutral, and spherically symmetric state - the state that was used 
+            to generate the setup.
+            '''
+            
+            E_ref = self.calc.setups[0].E
+            N = self.calc.setups[0].Nc + self.calc.setups[0].Nv
+            ###########################
+            
+            # <psit_n | H | psit_m> + E_ref / N
+            h[k, :, :] = (self.gto2pw[k].conj().T @ Hpsit_nG) + (E_ref*np.eye(nao))/N
             # for j in range(nao):
             #     psit_nG = self.gto2pw[k].T.copy # j-th GTO in PW representation
             #     Htpsit_nG = apply_pseudo_hamiltonian(calc.wfs, k, calc.hamiltonian, psit_nG=ket)
@@ -370,23 +424,33 @@ class PAWKRHF(KRHF):
 
         return h
     
-    def update_calc(self, wfs, ham, dens):
+    def get_h_matrix_gpaw(self):
+        ham = self.calc.hamiltonian
+        wfs = self.calc.wfs
+        u = 0
+        psit_nG = self.gto2pw[0].T.copy()
+        h = mysterious_gpaw_H(ham, wfs, u, psit_nG=psit_nG)
+        return h
+    
+    def update_calc(self, wfs, ham, dens, fock, s1e):
         # get occ and mo_coeff
-        assert(self.mo_coeff is not None)
-        assert(self.mo_occ is not None)
-        assert(len(self.mo_coeff) == len(self.mo_occ))
+        mo_energy, mo_coeff = self.eig(fock, s1e)
+        mo_occ = self.get_occ(mo_energy, mo_coeff)
+        assert(mo_coeff is not None)
+        assert(mo_occ is not None)
+        assert(len(mo_coeff) == len(mo_occ))
 
         # TODO: update wfs using occ and mo_coeff
         # self.mo_coeff is (kpt, nao, nao) list of 2D array
         # self.mo_occ is (kpt, nao) list of 1D array
-        for k in len(self.mo_coeff):
-            mo_coeff_pw = self.gto2pw @ self.mo_coeff[k]
+        for k in range(len(mo_coeff)):
+            mo_coeff_pw = self.gto2pw @ mo_coeff[k]
             ###
             kpt = wfs.kpt_u[k]
             psit = kpt.psit.new(buf=mo_coeff_pw.T)
-            kpt.psit[:] = psit
+            wfs.kpt_u[k].psit[:] = psit
             ####
-            wfs.kpt_u[k].f_n = self.mo_occ[k] # aliasing?
+            wfs.kpt_u[k].f_n = mo_occ[k] # aliasing?
 
         # update dens and ham
         dens.update(wfs)
@@ -402,11 +466,11 @@ class PAWKRHF(KRHF):
         # if h1e_kpts is None: h1e_kpts = mf.get_hcore()
         # if vhf_kpts is None: vhf_kpts = mf.get_veff(mf.cell, dm_kpts)
         # f_kpts = h1e_kpts + vhf_kpts
-        # TODO: update calc hamiltonian
+        #############
         calc = self.calc
         if cycle > 0:
-            self.update_calc(calc.wfs, calc.hamiltonian, calc.dens)
-        f_kpts = self.get_h_matrix()
+            self.update_calc(calc.wfs, calc.hamiltonian, calc.density, fock_last, s1e)
+        f_kpts = self.get_h_matrix() 
         #################
 
         if cycle < 0 and diis is None:  # Not inside the SCF iteration
@@ -442,7 +506,7 @@ class PAWKRHF(KRHF):
         calc = self.calc
         nao = self.cell.nao
         nkpts = len(self.kpts)
-        result = np.zeros((nkpts, nao, nao), dtype=np.complex128)
+        result = np.zeros((nkpts, nao, nao), dtype=np.float64)
         
         for k in range(nkpts):
             # the copy is somehow necessary to avoid bug when doing integral in gpaw
