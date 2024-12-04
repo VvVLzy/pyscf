@@ -4,24 +4,29 @@ import numpy as np
 
 from gpaw import GPAW, PW
 from gpaw.utilities import unpack_hermitian
-from gpaw.matrix import matrix_matrix_multiply as mmm
 
 from pyscf.pbc.scf.khf import KRHF
 
-import pyscf.pbc.gto as pbcgto
-from pyscf.pbc.tools import pyscf_ase
 from pyscf import __config__
 from pyscf.scf import hf as mol_hf
 from pyscf import lib
-from pyscf.pbc.scf import hf as pbchf
+from pyscf.lib import logger
 
-from ase.lattice.cubic import SimpleCubic
-from ase.dft.kpoints import monkhorst_pack
+# TODO: PySCF kpoint is in 1/Bohr, need to convert to fractional
+# coords wrt reciprocal lattice vector before passing into GPAW
+# maybe the other way around is better: generate fractional kpts
+# in gpaw; then convert and pass into pyscf.
 
-from functools import partial
+
+CHECK_COULOMB_IMAG = getattr(__config__, 'pbc_scf_check_coulomb_imag', True)
 
 def init_gpaw_calc(system, kpts, nbands, e_cut=350, name='He'):
-    calc = GPAW(mode=PW(e_cut), kpts=kpts, nbands=nbands,
+    # My entire implementation rely on changing GPAW dtype to comoplex
+    # regardless of whether there is only gamma point
+    # this is to ensure the GTOs are completely expanded
+    mode = PW(e_cut)
+    mode.force_complex_dtype = True
+    calc = GPAW(mode=mode, kpts=kpts, nbands=nbands,
                 txt=f'gpaw-{name}.txt')
 
     calc.atoms = system.copy()
@@ -55,6 +60,17 @@ def apply_overlap(wfs, u, calculate_P_ani=True, psit_nG=None):
         If None, wfs.kpt_u[u].psit_nG is used.
 
     """
+
+    '''
+    Notes on normalization convention in GPAW:
+    https://gitlab.com/gpaw/gpaw/-/blob/master/gpaw/pw/descriptor.py?ref_type=heads#L366
+    This is likely to be the right prefactor for "old" GPAW, and complex wave functions.
+    For real wave functions, it is more complicated. Also expressed in this function.
+    But you could just use pd.integrate
+    Also helpful:
+    https://gpaw.readthedocs.io/documentation/orthogonalization.html
+    '''
+
     # psi_t at u-th kpoint, u is the combined spin and kpoint index
     kpt = wfs.kpt_u[u]
 
@@ -74,12 +90,15 @@ def apply_overlap(wfs, u, calculate_P_ani=True, psit_nG=None):
         # the original function does not update P_ani
         wfs.pt.integrate(psit_nG, P_ani, kpt.q)
     else:
-        for a, P_ni in kpt.P_ani.items():
-            P_ani[a][:] = P_ni
+        # for a, P_ni in kpt.P_ani.items():
+        #     P_ani[a][:] = P_ni
+        # TODO: can probably store the P_ani calculated to prevent
+        # redundant calculations afterwards
+        pass
+        
 
     for a, P_ni in P_ani.items():
         P_ani[a] = np.dot(P_ni, wfs.setups[a].dO_ii)
-        # gemm(1.0, wfs.setups[a].dO_ii, P_xi, 0.0, P_xi, 'n')
     wfs.pt.add(Spsit_nG, P_ani, kpt.q)  # b_xG += sum_ai pt^a_i P_ani
 
     return Spsit_nG
@@ -104,18 +123,7 @@ def apply_pseudo_hamiltonian(wfs, u, ham, psit_nG=None):
     kpt = wfs.kpt_u[u]
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
 
-    # nbands = wfs.bd.mynbands
-    # Htpsit_nG = wfs.empty(nbands, q=kpt.q)
     Htpsit_nG = np.zeros_like(psit_nG)
-
-    # # compare gpaw and my implementation
-    # psit = kpt.psit.new(buf=psit_nG)
-    # tmp = psit.new(buf=wfs.work_array)
-    # H = wfs.work_matrix_nn
-    # P2 = kpt.projections.new()
-    # Ht = partial(wfs.apply_pseudo_hamiltonian, kpt, ham)
-    # psit.matrix_elements(operator=Ht, result=tmp, out=H,
-    #                      symmetric=True, cc=True)
 
     # this function can only be used if we use GPAW's wfs
     # maybe we don't want to do that...
@@ -143,6 +151,7 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
         If None, wfs.kpt_u[u].psit_nG is used.
 
     """
+
     # psi_t at u-th kpoint, u is the combined spin and kpoint index
     kpt = wfs.kpt_u[u]
 
@@ -158,7 +167,7 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
     shape = psit_nG.shape[0]
     P_ani = wfs.pt.dict(shape)
 
-    if calculate_P_ani:  # TODO calculate_P_ani=False is experimental
+    if calculate_P_ani:
         wfs.pt.integrate(psit_nG, P_ani, kpt.q)
     else:
         for a, P_ni in kpt.P_ani.items():
@@ -172,65 +181,24 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
 
     return dHpsit_nG
 
-def mysterious_gpaw_H(ham, wfs, u, psit_nG):
-    kpt = wfs.kpt_u[u]
-    psit = kpt.psit
+def update_dens(dens, wfs):
+    dens.timer.start('Density')
+    with dens.timer('Pseudo density'):
+        dens.calculate_pseudo_density(wfs)
+    with dens.timer('Atomic density matrices'):
+        wfs.calculate_atomic_density_matrices(dens.D_asp)
+    with dens.timer('Multipole moments'):
+        comp_charge, _Q_aL = dens.calculate_multipole_moments()
 
-    # update wfs
-    # tmp1 = psit.new(buf=psit_nG)
-    # psit[:] = tmp1
+    # if isinstance(wfs, LCAOWaveFunctions):
+    #     dens.timer.start('Normalize')
+    #     dens.normalize(comp_charge)
+    #     dens.timer.stop('Normalize')
 
-    tmp = psit.new(buf=wfs.work_array)
-    H = wfs.work_matrix_nn
-    P2 = kpt.projections.new()
-
-    Ht = partial(wfs.apply_pseudo_hamiltonian, kpt, ham)
-
-    # We calculate the complex conjugate of H, because
-    # that is what is most efficient with BLAS given the layout of
-    # our matrices.
-    psit.matrix_elements(operator=Ht, result=tmp, out=H,
-                            symmetric=True, cc=True)
-    ham.dH(kpt.projections, out=P2)
-    mmm(1.0, kpt.projections, 'N', P2, 'C', 1.0, H, symmetric=True)
-    ham.xc.correct_hamiltonian_matrix(kpt, H.array)
-
-    return H.array
-
-def Ht_example(wfs, u, ham, psit_nG = None, calculate_P_ani=False, scalewithocc=True):
-    kpt = wfs.kpt_u[u]
-    psit_nG = psit_nG if psit_nG is not None else kpt.psit_nG
-
-    nbands = wfs.bd.mynbands
-    Hpsi_nG = wfs.empty(nbands, q=kpt.q)
-    wfs.apply_pseudo_hamiltonian(kpt, ham, psit_nG, Hpsi_nG)
-
-    c_axi = {}
-    if calculate_P_ani:
-        dH_asii = ham.potential.dH_asii
-        for a, P_xi in kpt.P_ani.items():
-            dH_ii = dH_asii[a][kpt.s]
-            c_xi = np.dot(P_xi, dH_ii)
-            c_axi[a] = c_xi
-    else:
-        for a, P_xi in kpt.P_ani.items():
-            dH_ii = unpack_hermitian(ham.dH_asp[a][kpt.s])
-            c_xi = np.dot(P_xi, dH_ii)
-            c_axi[a] = c_xi
-
-    # not sure about this:
-    # ham.xc.add_correction(
-    #     kpt, kpt.psit_nG, Hpsi_nG, kpt.P_ani, c_axi, n_x=None,
-    #     calculate_change=False)
-    # add projectors to the H|psi_i>
-
-    wfs.pt.add(Hpsi_nG, c_axi, kpt.q)
-    # # scale with occupation numbers
-    # if scalewithocc:
-    #     for i, f in enumerate(kpt.f_n):
-    #         Hpsi_nG[i] *= f
-    return psit_nG, Hpsi_nG
-
+    # dens.timer.start('Mix')
+    # dens.mix(comp_charge) # disable GPAW's DM
+    # dens.timer.stop('Mix')
+    dens.timer.stop('Density')
 
 def apply_to_single_u(ham, wfs, u):
     '''
@@ -244,56 +212,6 @@ def apply_to_single_u(ham, wfs, u):
 
     return Htpsit_nG + dHpsit_nG, Spsit_nG
 
-def main():
-    # Initialize ASE atom
-    ase_atom=SimpleCubic(symbol='He', latticeconstant=8)
-    print(ase_atom.get_volume())
-
-    # Initialize PySCF cell
-    cell = pbcgto.Cell()
-    cell.verbose = 5
-    cell.atom=pyscf_ase.ase_atoms_to_pyscf(ase_atom)
-    cell.a=ase_atom.cell
-    cell.basis = 'gth-szx'     # TODO: import smooth Gaussian basis from DOI: 10.1039/d0cp05229a
-    cell.pseudo = 'gth-pade'   # TODO: should not need this with PAW
-    cell.build()
-
-    # Initialize kpoints
-    nk = [1,1,1]  # gamma point only for now...
-    kpts = cell.make_kpts(nk)
-
-    # TODO: PySCF kpoint is in 1/Bohr, need to convert to fractional
-    # coords wrt reciprocal lattice vector before passing into GPAW
-    # maybe the other way around is better: generate fractional kpts
-    # in gpaw; then convert and pass into pyscf.
-
-    # initialize GPAW calculator
-    calc = init_gpaw_calc(ase_atom, kpts, cell.nao, e_cut=350)
-
-    pawkrhf = PAWKRHF(cell, calc, kpts)
-
-    s1e = pawkrhf.get_ovlp()
-    coords = pawkrhf.cell.gen_uniform_grids((200,200,200))
-    GTO = pawkrhf.cell.pbc_eval_gto("GTOval_sph", coords, kpts=pawkrhf.kpts)[0]
-    dv = pawkrhf.cell.vol / GTO.shape[0]
-    norm = GTO.conj().T @ GTO * dv # GTO normalized to 1 within the UC
-    # this implies that the fourier coefficient normalize to 1/V
-    # I made sure that the GTO's, in fourier representation also normalize to one.
-    normG = pawkrhf.gto2pw[0][:, 0].conj().T @ pawkrhf.gto2pw[0][:, 0]
-
-    # psit_nG = pawkrhf.gto2pw[0].T.copy()
-    # Htpsitng = apply_pseudo_hamiltonian(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG)
-    # dHpsitng = apply_PAW_correction(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=False)
-    # psit_nG2, Htpsitng1 = Ht_example(calc.wfs, 0, calc.hamiltonian, psit_nG=psit_nG)
-    # h = pawkrhf.get_h_matrix()
-    # h1 = pawkrhf.get_h_matrix_gpaw()
-
-    # Manual Initialization of dm now
-    dm0 = np.zeros((1,1,1))
-    dm0[0,0,0] = 2
-    print(pawkrhf.kernel(dm0=dm0))
-    print('Hooray')
-
 
 class PAWKRHF(KRHF):
     def __init__(self, cell, calc,
@@ -304,48 +222,16 @@ class PAWKRHF(KRHF):
         self.cell = cell
         
         # construct the basis transformation matrix from GTO to PW
-        # self.expand_GTO_in_PW()
         t1 = time.time()
         self.expand_GTO_in_PW_by_fft()
         t2 = time.time()
-        # self.expand_GTO_in_PW_by_grid_int()
-        # t3 = time.time()
-
         print(f'FFT takes {t2-t1} seconds')
-        # print(f'Grid int takes {t3-t2} seconds')
 
+        # normalize AOs such that <AO | S | AO> = 1
+        self.normalize_AOs()
 
-    def expand_GTO_in_PW_by_grid_int(self):
-        '''
-        Calculate the expansion coefficient of each GTO in
-        the auxillary PW basis; outputs a matrix of size
-        (n_PW, n_GTO)
-        '''
-        mesh = self.calc.wfs.gd.N_c
-        coords = self.cell.get_uniform_grids(mesh)
+        print('Initialized')
 
-        # list of (nx*ny*nz, nao) arrays of length nkpts
-        GTOs = self.cell.pbc_eval_gto("GTOval_sph", coords, kpts=self.kpts)
-
-        self.gto2pw_grid = list()
-        for k in range(len(self.kpts)):
-            pd = self.calc.wfs.pd
-
-            # get all the reciprocal vectors for the plane wave basis
-            # i.e. (k+G) for each e^（-i(k+G)*r）, this is a (n_PW, 3) vector
-            kplusG = pd.get_reciprocal_vectors(k, add_q=True)
-
-            # e^-i(k+G)*r: an (n_PW, nx*ny*nz) array
-            expmikGr = np.exp(-1j*(kplusG @ coords.T))
-
-            # get each all GTOs for some k-point on a real sapce grid
-            # representation; this should give (nx*ny*nz, nao) array
-            GTO = GTOs[k]
-
-            # integrate and normalize
-            assert(expmikGr.shape[1] == GTO.shape[0])
-            ngrid = expmikGr.shape[1]
-            self.gto2pw_grid.append(expmikGr @ GTO / ngrid)
 
     def expand_GTO_in_PW_by_fft(self):
         '''
@@ -358,25 +244,53 @@ class PAWKRHF(KRHF):
         mesh = self.calc.wfs.gd.N_c
         coords = self.cell.get_uniform_grids(mesh)
         GTOs = self.cell.pbc_eval_gto("GTOval_sph", coords, kpts=self.kpts)
-        # GTOs = [np.ones_like(GTOs[0])]
-        
 
         self.gto2pw = list()
+        self.aos_3d = list()    # for reconstructing AO's from pseudo AO's
+        self.aos_k = list()     # for verifying PW expansion is complete
         for k in range(len(self.kpts)):
             npw, nao = self.calc.wfs.ng_k[k], self.cell.nao
             gto2pw_k = np.zeros((npw, nao), dtype=np.complex128)
+            ao_k = np.zeros((npw, nao), dtype=np.complex128)
             for j in range(nao):
                 ao_1d = GTOs[k][:, j]
                 ao_3d = ao_1d.reshape(mesh)
-                gto2pw_k[:, j] = self.calc.wfs.pd.fft(ao_3d, q=k) / ao_1d.shape[0]*np.sqrt(self.cell.vol)
-            self.gto2pw.append(gto2pw_k)
+                self.aos_3d.append(ao_3d) # need to be more sophisticated for multiple k
 
-    # def GTO2PW(coeff, mat): 
-    #     '''
-    #     Takes coefficient under GTO basis and map to coefficient
-    #     under the plane wave basis (n_GTO, 1)->(n_PW, 1)
-    #     '''
-    #     return mat @ coeff
+                # fft without any normalization in front
+                ao_3d_k = self.calc.wfs.pd.fft(ao_3d, q=k)
+
+                # normalized so that <psit | psit> = 1
+                # this is a good sanity check that the expansion is complete
+                ao_3d_k = ao_3d_k / ao_1d.shape[0]*np.sqrt(self.cell.vol)
+                ao_k[:, j] = ao_3d_k
+
+                # # normalized so that <psit | psit> * dv = 1
+                # ao_3d_k /= np.sqrt(dv) # normalize AOs will take care of it
+
+                gto2pw_k[:, j] = ao_3d_k
+            self.gto2pw.append(gto2pw_k)
+            self.aos_k.append(ao_k)
+
+    def normalize_AOs(self):
+        '''
+        Rescale each AOs so that they are normalized,
+        But we don't orthogonalize different AOs.
+        In practice, this means that the diagonal element
+        of the overlap matrix should all be 1's, for each kpt
+        '''
+        S = self.get_ovlp()
+
+        for k in range(len(S)):
+            assert(S[k].shape[0] == S[k].shape[1])
+            for ao in range(S[k].shape[0]):
+                norm = S[k][ao, ao]
+                self.gto2pw[k][:, ao] /= np.sqrt(norm)
+
+        S_new = self.get_ovlp()
+        for k in range(len(S_new)):
+            for ao in range(S_new[k].shape[0]):
+                assert(np.isclose(S_new[k][ao, ao], 1))
 
     def get_h_matrix(self):
         '''
@@ -385,76 +299,95 @@ class PAWKRHF(KRHF):
         nkpts = len(self.kpts)
         nao = self.cell.nao
         calc = self.calc
-        h = np.zeros((nkpts, nao, nao), dtype=np.float64)
+        h = np.zeros((nkpts, nao, nao), dtype=np.complex128)
 
         for k in range(nkpts):
+            dv = calc.wfs.kpt_u[k].psit.dv
             # recall each column of gto2pw[k] is PW coefficient of AO, gto2pw[k].shape = (N_PW, nao)
             psit_nG = self.gto2pw[k].T.copy()
             Htpsit_nG = apply_pseudo_hamiltonian(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG).T
             dHpsit_nG = apply_PAW_correction(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=True).T
             Hpsit_nG = Htpsit_nG + dHpsit_nG    # H |psit_nG>.shape = (N_PW, nao)
             
-            ###########################
-            # energy offset (very not sure about this)
-            # I assume GPAW calculates E = E_total - E_ref
-            # So I did the following correction 
-            # <psit_n | Fock | psit_m> = <psit_n | H | psit_m> + E_ref / N
-            # The following is taken from gpaw documentation:
-            '''
-            The GPAW code calculates energies relative to the energy
-            of separated reference atoms, where each atom is in a spin-paired, 
-            neutral, and spherically symmetric state - the state that was used 
-            to generate the setup.
-            '''
-            
-            E_ref = self.calc.setups[0].E
-            N = self.calc.setups[0].Nc + self.calc.setups[0].Nv
-            ###########################
-            
-            # <psit_n | H | psit_m> + E_ref / N
-            h[k, :, :] = (self.gto2pw[k].conj().T @ Hpsit_nG) + (E_ref*np.eye(nao))/N
-            # for j in range(nao):
-            #     psit_nG = self.gto2pw[k].T.copy # j-th GTO in PW representation
-            #     Htpsit_nG = apply_pseudo_hamiltonian(calc.wfs, k, calc.hamiltonian, psit_nG=ket)
-            #     dHpsit_nG = apply_PAW_correction(calc.wfs, k, calc.hamiltonian, psit_nG=ket)
-            #     Hpsit_nG = Htpsit_nG + dHpsit_nG    # H |psi_j>
-            #     for i in range(nao):
-            #         bra = self.gto2pw[k][:, i].conj()
-            #         h[k, i, j] = bra.dot(Hpsit_nG)     # <psi_i| H | psi_j>
+            h[k, :, :] = self.gto2pw[k].conj().T @ Hpsit_nG * dv
 
         return h
     
-    def get_h_matrix_gpaw(self):
-        ham = self.calc.hamiltonian
-        wfs = self.calc.wfs
-        u = 0
-        psit_nG = self.gto2pw[0].T.copy()
-        h = mysterious_gpaw_H(ham, wfs, u, psit_nG=psit_nG)
-        return h
-    
-    def update_calc(self, wfs, ham, dens, fock, s1e):
-        # get occ and mo_coeff
-        mo_energy, mo_coeff = self.eig(fock, s1e)
-        mo_occ = self.get_occ(mo_energy, mo_coeff)
-        assert(mo_coeff is not None)
-        assert(mo_occ is not None)
-        assert(len(mo_coeff) == len(mo_occ))
+    def update_calc(self, mo_coeff_kpts, mo_occ_kpts, mo_energy_kpts):
+        assert(mo_coeff_kpts is not None)
+        assert(mo_occ_kpts is not None)
+        assert(len(mo_coeff_kpts) == len(mo_occ_kpts))
 
-        # TODO: update wfs using occ and mo_coeff
         # self.mo_coeff is (kpt, nao, nao) list of 2D array
         # self.mo_occ is (kpt, nao) list of 1D array
-        for k in range(len(mo_coeff)):
-            mo_coeff_pw = self.gto2pw @ mo_coeff[k]
-            ###
+
+        wfs = self.calc.wfs
+        dens = self.calc.density
+        ham = self.calc.hamiltonian
+
+        for k in range(len(mo_coeff_kpts)):
+            mo_coeff_pw = self.gto2pw[k] @ mo_coeff_kpts[k]
             kpt = wfs.kpt_u[k]
+
+            # update |psit>
             psit = kpt.psit.new(buf=mo_coeff_pw.T)
-            wfs.kpt_u[k].psit[:] = psit
-            ####
-            wfs.kpt_u[k].f_n = mo_occ[k] # aliasing?
+            kpt.psit[:] = psit
+            
+            # update < p | psit >
+            # TODO: potential speed up by using stored <p | AO>
+            P = kpt.projections.new()
+            kpt.psit.matrix_elements(wfs.pt, out=P)
+            kpt.projections = P
+            
+            # update occupation number and band energy
+            kpt.f_n = mo_occ_kpts[k].copy()
+            kpt.eps_n = mo_energy_kpts[k].copy()
 
         # update dens and ham
-        dens.update(wfs)
+        update_dens(dens, wfs)
         ham.update(dens)
+
+    def get_occ(self, mo_energy_kpts=None, mo_coeff_kpts=None):
+        '''Label the occupancies for each orbital for sampled k-points.
+
+        This is a k-point version of scf.hf.SCF.get_occ
+        '''
+        if mo_energy_kpts is None: mo_energy_kpts = self.mo_energy
+
+        nkpts = len(mo_energy_kpts)
+        nocc = self.cell.tot_electrons(nkpts) // 2
+
+        mo_energy = np.sort(np.hstack(mo_energy_kpts))
+        fermi = mo_energy[nocc-1]
+        mo_occ_kpts = []
+        for mo_e in mo_energy_kpts:
+            mo_occ_kpts.append((mo_e <= fermi).astype(np.double) * 2)
+
+        if nocc < mo_energy.size:
+            logger.info(self, 'HOMO = %.12g  LUMO = %.12g',
+                        mo_energy[nocc-1], mo_energy[nocc])
+            if mo_energy[nocc-1]+1e-3 > mo_energy[nocc]:
+                logger.warn(self, 'HOMO %.12g == LUMO %.12g',
+                            mo_energy[nocc-1], mo_energy[nocc])
+        else:
+            logger.info(self, 'HOMO = %.12g', mo_energy[nocc-1])
+
+        if self.verbose >= logger.DEBUG:
+            np.set_printoptions(threshold=len(mo_energy))
+            logger.debug(self, '     k-point                  mo_energy')
+            for k,kpt in enumerate(self.cell.get_scaled_kpts(self.kpts)):
+                logger.debug(self, '  %2d (%6.3f %6.3f %6.3f)   %s %s',
+                            k, kpt[0], kpt[1], kpt[2],
+                            np.sort(mo_energy_kpts[k][mo_occ_kpts[k]> 0]),
+                            np.sort(mo_energy_kpts[k][mo_occ_kpts[k]==0]))
+            np.set_printoptions(threshold=1000)
+
+        #######################
+        # Append script to communicate with the GPAW calculator
+        #######################
+        self.update_calc(mo_coeff_kpts, mo_occ_kpts, mo_energy_kpts)
+
+        return mo_occ_kpts
 
     def get_fock(self, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
                 diis_start_cycle=None, level_shift_factor=None, damp_factor=None,
@@ -462,14 +395,10 @@ class PAWKRHF(KRHF):
         
         h1e_kpts, s_kpts, vhf_kpts, dm_kpts = h1e, s1e, vhf, dm
         # Parts to modify
-        #################
         # if h1e_kpts is None: h1e_kpts = mf.get_hcore()
         # if vhf_kpts is None: vhf_kpts = mf.get_veff(mf.cell, dm_kpts)
         # f_kpts = h1e_kpts + vhf_kpts
         #############
-        calc = self.calc
-        if cycle > 0:
-            self.update_calc(calc.wfs, calc.hamiltonian, calc.density, fock_last, s1e)
         f_kpts = self.get_h_matrix() 
         #################
 
@@ -506,22 +435,103 @@ class PAWKRHF(KRHF):
         calc = self.calc
         nao = self.cell.nao
         nkpts = len(self.kpts)
-        result = np.zeros((nkpts, nao, nao), dtype=np.float64)
+        s = np.zeros((nkpts, nao, nao), dtype=np.complex128)
         
         for k in range(nkpts):
+            # GPAW normalization
+            dv = calc.wfs.kpt_u[k].psit.dv
+
             # the copy is somehow necessary to avoid bug when doing integral in gpaw
             psit_nG = self.gto2pw[k].T.copy()
             Spsit_nG = apply_overlap(calc.wfs, k, psit_nG=psit_nG).T
-            result[k, :, :] = self.gto2pw[k].conj().T @ Spsit_nG
-            # for j in range(nao):
-            #     ket = self.gto2pw[k][:,j] # j-th GTO in PW representation
-            #     Spsit_nG = apply_overlap(calc.wfs, k, psit_nG=ket)
-            #     for i in range(nao):
-            #         bra = self.gto2pw[:, i].conj()
-            #         result[k, i, j] = bra.dot(Spsit_nG)
+            s[k, :, :] = self.gto2pw[k].conj().T @ Spsit_nG * dv
+
+        return s
+    
+    def energy_elec(self, dm_kpts=None, h1e_kpts=None, vhf_kpts=None):
+        '''
+        GPAW energy
+        '''
+        # if dm_kpts is None: dm_kpts = mf.make_rdm1()
+        # if h1e_kpts is None: h1e_kpts = mf.get_hcore()
+        # if vhf_kpts is None: vhf_kpts = mf.get_veff(mf.cell, dm_kpts)
+
+        # nkpts = len(dm_kpts)
+        # e1 = 1./nkpts * np.einsum('kij,kji', dm_kpts, h1e_kpts)
+        # e_coul = 1./nkpts * np.einsum('kij,kji', dm_kpts, vhf_kpts) * 0.5
+        # mf.scf_summary['e1'] = e1.real
+        # mf.scf_summary['e2'] = e_coul.real
+        # logger.debug(mf, 'E1 = %s  E_coul = %s', e1, e_coul)
+        # if CHECK_COULOMB_IMAG and abs(e_coul.imag > mf.cell.precision*10):
+        #     logger.warn(mf, "Coulomb energy has imaginary part %s. "
+        #                 "Coulomb integrals (e-e, e-N) may not converge !",
+        #                 e_coul.imag)
+        # return (e1+e_coul).real, e_coul.real
         
-        return result
 
+        calc = self.calc
+        wfs = calc.wfs
+        if wfs.kpt_u[0].eps_n is None:
+            # initialization
+            s1e = self.get_ovlp()
+            fock = self.get_fock()
+            mo_energy, mo_coeff = self.eig(fock, s1e)
+            mo_occ = self.get_occ(mo_energy, mo_coeff) # to update calc.wfs, dens, ham
+        # wfs.eigensolver.iterate(ham, wfs)
+        # e_entropy = wfs.calculate_occupation_numbers(fix_fermi_level=False) ### !!
+        e_entropy = 0 # TODO: True for ground state calculation
+        calc.hamiltonian.get_energy(e_entropy, wfs,
+                                    kin_en_using_band=True,
+                                    e_sic=0.0) # not sure what e_sic is yet
+        e_total = calc.hamiltonian.e_total_extrapolated
+        e_coul = calc.hamiltonian.e_coulomb
 
-if __name__ == '__main__':
-    main()
+        '''
+        these energy are relative energies: 
+        "The GPAW code calculates energies relative to the energy of separated reference atoms,
+        where each atom is in a spin-paired, neutral, and spherically symmetric state - the state
+        that was used to generate the setup"
+
+        we could try to recover the absolute (true) total energy by accounting
+        for the reference eneregy contained in the PAW dataset.
+        but even then, the energy should not be the same as the Hartree Fock total energy:
+        The true number is always lower, because most atoms have a spin-polarized and non-spherical
+        symmetric ground state, with an energy that is lower than that of the spin-paired,
+        and spherically symmetric reference atom.
+        '''
+        # TODO: these energies already include nuc-nuc, need to modify hf.e_total
+        return e_total.real, e_coul.real
+    
+    def get_veff(self, cell=None, dm_kpts=None, dm_last=0, vhf_last=0, hermi=1,
+                 kpts=None, kpts_band=None):
+        '''Hartree-Fock potential matrix for the given density matrix.
+        See :func:`scf.hf.get_veff` and :func:`scf.hf.RHF.get_veff`
+        '''
+        # if dm_kpts is None:
+        #     dm_kpts = self.make_rdm1()
+        # vj, vk = self.get_jk(cell, dm_kpts, hermi, kpts, kpts_band)
+        # return vj - vk * .5
+        # TODO: "trivialize" this function for now...
+        return 0
+    
+    def energy_tot(mf, dm=None, h1e=None, vhf=None):
+        r'''Total Hartree-Fock energy, electronic part plus nuclear repulsion
+        See :func:`scf.hf.energy_elec` for the electron part
+
+        Note this function has side effects which cause mf.scf_summary updated.
+
+        '''
+        # nuc = mf.energy_nuc()
+        nuc = 0 # GPAW energy already includes nuc-nuc interaction
+        mf.scf_summary['nuc'] = nuc.real
+
+        e_tot = mf.energy_elec(dm, h1e, vhf)[0] + nuc
+        if mf.do_disp():
+            if 'dispersion' in mf.scf_summary:
+                e_tot += mf.scf_summary['dispersion']
+            else:
+                e_disp = mf.get_dispersion()
+                mf.scf_summary['dispersion'] = e_disp
+                e_tot += e_disp
+
+        return e_tot
