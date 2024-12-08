@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 
-from gpaw import GPAW, PW
+from gpaw import GPAW, PW, Mixer
 from gpaw.utilities import unpack_hermitian
 
 from pyscf.pbc.scf.khf import KRHF
@@ -20,14 +20,49 @@ from pyscf.lib import logger
 
 CHECK_COULOMB_IMAG = getattr(__config__, 'pbc_scf_check_coulomb_imag', True)
 
-def init_gpaw_calc(system, kpts, nbands, e_cut=350, name='He'):
+def project_gpaw_to_AO(calc, cell, kpts, k=0):
+    '''
+    works for one kpt only for now
+    '''
+    mesh = calc.wfs.gd.N_c
+    nbands = calc.wfs.bd.nbands
+    psit_Rn = np.zeros((mesh.prod(), nbands), dtype=np.complex128)
+    
+    for i in range(nbands):
+        # normalize psit_G
+        psit_G = calc.wfs.kpt_u[0].psit_nG[i]
+        norm = np.linalg.norm(psit_G)
+        psit_G /= norm
+
+        # ifft to get real space rep
+        psit_R = calc.wfs.pd.ifft(psit_G, q=k)
+        normalization = calc.wfs.gd.N_c.prod() / np.sqrt(calc.wfs.gd.volume)
+        psit_R *= normalization
+        norm = np.sum(psit_R.conj() * psit_R)*calc.wfs.gd.dv # normalized within u.c. indeed
+        psit_Rn[:, i] = psit_R.reshape(-1, )
+
+    
+    coords = cell.get_uniform_grids(mesh)
+    AO_Rj = cell.pbc_eval_gto("GTOval_sph", coords, kpts=kpts)[0]
+    c_jn = AO_Rj.T.conj() @ psit_Rn * calc.wfs.gd.dv
+
+    from pyscf.pbc.scf.hf import get_ovlp
+    S_inv_ij = np.linalg.inv(get_ovlp(cell, kpts)[k])
+
+    P_nn = c_jn.T.conj() @ S_inv_ij @ c_jn
+
+    return P_nn
+
+def init_gpaw_calc(system, kpts, nbands, e_cut=350, name=None, **kwargs):
     # My entire implementation rely on changing GPAW dtype to comoplex
     # regardless of whether there is only gamma point
     # this is to ensure the GTOs are completely expanded
     mode = PW(e_cut)
     mode.force_complex_dtype = True
     calc = GPAW(mode=mode, kpts=kpts, nbands=nbands,
-                txt=f'gpaw-{name}.txt')
+                txt=name, mixer=Mixer(beta=1, nmaxold=1, weight=0),
+                **kwargs) # TODO: Make sure that Mixer correctly disables GPAW mixer
+    # https://gpaw.readthedocs.io/documentation/densitymix/densitymix.html#densitymix
 
     calc.atoms = system.copy()
 
@@ -196,7 +231,7 @@ def update_dens(dens, wfs):
     #     dens.timer.stop('Normalize')
 
     # dens.timer.start('Mix')
-    # dens.mix(comp_charge) # disable GPAW's DM
+    dens.mix(comp_charge) # disable GPAW's DM
     # dens.timer.stop('Mix')
     dens.timer.stop('Density')
 
@@ -313,12 +348,12 @@ class PAWKRHF(KRHF):
 
         return h
     
-    def update_calc(self, mo_coeff_kpts, mo_occ_kpts, mo_energy_kpts):
+    def update_calc(self, mo_coeff_kpts, mo_occ_kpts, mo_energy_kpts, fermi):
         assert(mo_coeff_kpts is not None)
         assert(mo_occ_kpts is not None)
         assert(len(mo_coeff_kpts) == len(mo_occ_kpts))
 
-        # self.mo_coeff is (kpt, nao, nao) list of 2D array
+        # self.mo_coeff is (kpt, nao, nmo) list of 2D array
         # self.mo_occ is (kpt, nao) list of 1D array
 
         wfs = self.calc.wfs
@@ -342,6 +377,8 @@ class PAWKRHF(KRHF):
             # update occupation number and band energy
             kpt.f_n = mo_occ_kpts[k].copy()
             kpt.eps_n = mo_energy_kpts[k].copy()
+
+        wfs.fermi_levels = np.array([fermi])
 
         # update dens and ham
         update_dens(dens, wfs)
@@ -385,7 +422,7 @@ class PAWKRHF(KRHF):
         #######################
         # Append script to communicate with the GPAW calculator
         #######################
-        self.update_calc(mo_coeff_kpts, mo_occ_kpts, mo_energy_kpts)
+        self.update_calc(mo_coeff_kpts, mo_occ_kpts, mo_energy_kpts, fermi)
 
         return mo_occ_kpts
 
@@ -512,6 +549,28 @@ class PAWKRHF(KRHF):
         # vj, vk = self.get_jk(cell, dm_kpts, hermi, kpts, kpts_band)
         # return vj - vk * .5
         # TODO: "trivialize" this function for now...
+        return 0
+    
+    def get_hcore(mf, cell=None, kpts=None):
+        '''Get the core Hamiltonian AO matrices at sampled k-points.
+
+        Args:
+            kpts : (nkpts, 3) ndarray
+
+        Returns:
+            hcore : (nkpts, nao, nao) ndarray
+        '''
+        # if cell is None: cell = mf.cell
+        # if kpts is None: kpts = mf.kpts
+        # if cell.pseudo:
+        #     nuc = lib.asarray(mf.with_df.get_pp(kpts))
+        # else:
+        #     nuc = lib.asarray(mf.with_df.get_nuc(kpts))
+        # if len(cell._ecpbas) > 0:
+        #     from pyscf.pbc.gto import ecp
+        #     nuc += lib.asarray(ecp.ecp_int(cell, kpts))
+        # t = lib.asarray(cell.pbc_intor('int1e_kin', 1, 1, kpts))
+        # return nuc + t
         return 0
     
     def energy_tot(mf, dm=None, h1e=None, vhf=None):
