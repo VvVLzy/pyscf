@@ -2,7 +2,8 @@ import time
 
 import numpy as np
 
-from gpaw import GPAW, PW, Mixer
+from gpaw import GPAW, PW
+from gpaw.mixer import DummyMixer
 from gpaw.utilities import unpack_hermitian
 
 from pyscf.pbc.scf.khf import KRHF
@@ -44,12 +45,12 @@ def project_gpaw_to_AO(calc, cell, kpts, k=0):
     
     coords = cell.get_uniform_grids(mesh)
     AO_Rj = cell.pbc_eval_gto("GTOval_sph", coords, kpts=kpts)[0]
-    c_jn = AO_Rj.T.conj() @ psit_Rn * calc.wfs.gd.dv
+    c_nj = psit_Rn.T.conj() @ AO_Rj * calc.wfs.gd.dv
 
     from pyscf.pbc.scf.hf import get_ovlp
     S_inv_ij = np.linalg.inv(get_ovlp(cell, kpts)[k])
 
-    P_nn = c_jn.T.conj() @ S_inv_ij @ c_jn
+    P_nn = c_nj.conj() @ S_inv_ij @ c_nj.T
 
     return P_nn
 
@@ -60,7 +61,9 @@ def init_gpaw_calc(system, kpts, nbands, e_cut=350, name=None, **kwargs):
     mode = PW(e_cut)
     mode.force_complex_dtype = True
     calc = GPAW(mode=mode, kpts=kpts, nbands=nbands,
-                txt=name, mixer=Mixer(beta=1, nmaxold=1, weight=0),
+                txt=name,
+                # mixer=Mixer(beta=1, nmaxold=1, weight=0),
+                mixer=DummyMixer(),
                 **kwargs) # TODO: Make sure that Mixer correctly disables GPAW mixer
     # https://gpaw.readthedocs.io/documentation/densitymix/densitymix.html#densitymix
 
