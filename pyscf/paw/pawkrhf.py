@@ -1,10 +1,13 @@
 import time
+from copy import deepcopy
 
 import numpy as np
 
 from gpaw import GPAW, PW
 from gpaw.mixer import DummyMixer
 from gpaw.utilities import unpack_hermitian
+from gpaw.hybrids.paw import calculate_paw_stuff
+from gpaw.hybrids.scf import apply1
 
 from pyscf.pbc.scf.khf import KRHF
 
@@ -12,6 +15,8 @@ from pyscf import __config__
 from pyscf.scf import hf as mol_hf
 from pyscf import lib
 from pyscf.lib import logger
+
+from ase.units import Ha
 
 # TODO: PySCF kpoint is in 1/Bohr, need to convert to fractional
 # coords wrt reciprocal lattice vector before passing into GPAW
@@ -158,11 +163,22 @@ def apply_pseudo_hamiltonian(wfs, u, ham, psit_nG=None):
 
     """
 
+    # if psit_nG is None:
+    #     kpt = wfs.kpt_u[u]
+    #     psit_nG = kpt.psit_nG
+    # else:
+    #     kpt = wfs.kpt_u[u]
+    #     psit = kpt.psit.new()
+    #     psit.in_memory = False
+    #     psit.matrix.array = psit_nG.copy()
+    #     kpt.psit = psit
+
     kpt = wfs.kpt_u[u]
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
 
-    Htpsit_nG = np.zeros_like(psit_nG)
 
+    Htpsit_nG = np.zeros_like(psit_nG)
+    
     # this function can only be used if we use GPAW's wfs
     # maybe we don't want to do that...
     wfs.apply_pseudo_hamiltonian(kpt, ham, psit_nG, Htpsit_nG)
@@ -324,6 +340,7 @@ class PAWKRHF(KRHF):
             for ao in range(S[k].shape[0]):
                 norm = S[k][ao, ao]
                 self.gto2pw[k][:, ao] /= np.sqrt(norm)
+                # self.calc.kpt_u[k].psit
 
         S_new = self.get_ovlp()
         for k in range(len(S_new)):
@@ -368,6 +385,11 @@ class PAWKRHF(KRHF):
             kpt = wfs.kpt_u[k]
 
             # update |psit>
+            # Caution: messing with memory big time
+            # psit = kpt.psit.new()
+            # psit.in_memory = False
+            # psit.matrix.array = mo_coeff_pw.T.copy()
+            # kpt.psit = psit
             psit = kpt.psit.new(buf=mo_coeff_pw.T)
             kpt.psit[:] = psit
             
@@ -511,6 +533,8 @@ class PAWKRHF(KRHF):
 
         calc = self.calc
         wfs = calc.wfs
+        kpt = wfs.kpt_u[0] # works for one kpt only!!
+        xc = calc.hamiltonian.xc
         if wfs.kpt_u[0].eps_n is None:
             # initialization
             s1e = self.get_ovlp()
@@ -518,6 +542,28 @@ class PAWKRHF(KRHF):
             mo_energy, mo_coeff = self.eig(fock, s1e)
             mo_occ = self.get_occ(mo_energy, mo_coeff) # to update calc.wfs, dens, ham
         # wfs.eigensolver.iterate(ham, wfs)
+
+        # EXX/Hybrid energy correction
+        if xc.type == 'HYB' and (kpt.s, kpt.k) not in xc.v_sknG:
+            assert not any(s == kpt.s for s, k in xc.v_sknG)
+            paw_s = calculate_paw_stuff(wfs, xc.dens)
+            evc, evv, ekin, _ = apply1(
+                kpt, None,
+                wfs,
+                xc.coulomb, xc.sym,
+                paw_s[kpt.s])
+            if kpt.s == 0:
+                xc.evc = 0.0
+                xc.evv = 0.0
+                xc.ekin = 0.0
+            scale = 2 / wfs.nspins * xc.exx_fraction
+            xc.evc += evc * scale
+            xc.evv += evv * scale
+            xc.ekin += ekin * scale
+        #     xc.v_sknG = {(kpt.s, k): v_nG
+        #                     for k, v_nG in v_knG.items()}
+        # v_nG = xc.v_sknG.pop((kpt.s, kpt.k))
+
         # e_entropy = wfs.calculate_occupation_numbers(fix_fermi_level=False) ### !!
         e_entropy = 0 # TODO: True for ground state calculation
         calc.hamiltonian.get_energy(e_entropy, wfs,
@@ -554,7 +600,7 @@ class PAWKRHF(KRHF):
         # TODO: "trivialize" this function for now...
         return 0
     
-    def get_hcore(mf, cell=None, kpts=None):
+    def get_hcore(self, cell=None, kpts=None):
         '''Get the core Hamiltonian AO matrices at sampled k-points.
 
         Args:
@@ -576,24 +622,24 @@ class PAWKRHF(KRHF):
         # return nuc + t
         return 0
     
-    def energy_tot(mf, dm=None, h1e=None, vhf=None):
+    def energy_tot(self, dm=None, h1e=None, vhf=None):
         r'''Total Hartree-Fock energy, electronic part plus nuclear repulsion
         See :func:`scf.hf.energy_elec` for the electron part
 
-        Note this function has side effects which cause mf.scf_summary updated.
+        Note this function has side effects which cause self.scf_summary updated.
 
         '''
-        # nuc = mf.energy_nuc()
+        # nuc = self.energy_nuc()
         nuc = 0 # GPAW energy already includes nuc-nuc interaction
-        mf.scf_summary['nuc'] = nuc.real
+        self.scf_summary['nuc'] = nuc.real
 
-        e_tot = mf.energy_elec(dm, h1e, vhf)[0] + nuc
-        if mf.do_disp():
-            if 'dispersion' in mf.scf_summary:
-                e_tot += mf.scf_summary['dispersion']
+        e_tot = self.energy_elec(dm, h1e, vhf)[0] + nuc + self.calc.get_reference_energy()/Ha
+        if self.do_disp():
+            if 'dispersion' in self.scf_summary:
+                e_tot += self.scf_summary['dispersion']
             else:
-                e_disp = mf.get_dispersion()
-                mf.scf_summary['dispersion'] = e_disp
+                e_disp = self.get_dispersion()
+                self.scf_summary['dispersion'] = e_disp
                 e_tot += e_disp
 
         return e_tot
