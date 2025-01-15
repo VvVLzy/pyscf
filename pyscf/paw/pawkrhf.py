@@ -633,7 +633,7 @@ class PAWKRHF(KRHF):
         nuc = 0 # GPAW energy already includes nuc-nuc interaction
         self.scf_summary['nuc'] = nuc.real
 
-        e_tot = self.energy_elec(dm, h1e, vhf)[0] + nuc + self.calc.get_reference_energy()/Ha
+        e_tot = self.energy_elec(dm, h1e, vhf)[0] + nuc
         if self.do_disp():
             if 'dispersion' in self.scf_summary:
                 e_tot += self.scf_summary['dispersion']
