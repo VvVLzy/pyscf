@@ -406,7 +406,8 @@ class PAWKRHF(KRHF):
         wfs.fermi_levels = np.array([fermi])
 
         # update dens and ham
-        update_dens(dens, wfs)
+        # update_dens(dens, wfs)
+        dens.update(wfs)
         ham.update(dens)
 
     def get_occ(self, mo_energy_kpts=None, mo_coeff_kpts=None):
@@ -642,4 +643,4 @@ class PAWKRHF(KRHF):
                 self.scf_summary['dispersion'] = e_disp
                 e_tot += e_disp
 
-        return e_tot
+        return e_tot # energy is in Hartree
