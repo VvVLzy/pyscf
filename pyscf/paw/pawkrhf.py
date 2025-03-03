@@ -272,8 +272,9 @@ class PAWKRHF(KRHF):
                  kpts=np.zeros((1,3)),
                  exxdiv=getattr(__config__, 'pbc_scf_SCF_exxdiv', 'ewald')):
         super().__init__(cell, kpts, exxdiv)
-        self.calc = calc    # GPAW calculator
+        self.calc = calc        # GPAW calculator
         self.cell = cell
+        self.nbands = calc.wfs.kpt_u[0].psit_nG.shape[0]
         
         # construct the basis transformation matrix from GTO to PW
         t1 = time.time()
@@ -400,8 +401,8 @@ class PAWKRHF(KRHF):
             kpt.projections = P
             
             # update occupation number and band energy
-            kpt.f_n = mo_occ_kpts[k].copy()
-            kpt.eps_n = mo_energy_kpts[k].copy()
+            kpt.f_n = mo_occ_kpts[k][:self.nbands].copy()
+            kpt.eps_n = mo_energy_kpts[k][:self.nbands].copy()
 
         wfs.fermi_levels = np.array([fermi])
 
