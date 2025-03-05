@@ -7,7 +7,9 @@ from gpaw import GPAW, PW
 from gpaw.mixer import DummyMixer
 from gpaw.utilities import unpack_hermitian
 from gpaw.hybrids.paw import calculate_paw_stuff
-from gpaw.hybrids.scf import apply1
+from gpaw.hybrids.coulomb import coulomb_interaction
+from gpaw.hybrids.scf import apply1, apply2
+from gpaw.hybrids.symmetry import Symmetry
 
 from pyscf.pbc.scf.khf import KRHF
 
@@ -163,16 +165,6 @@ def apply_pseudo_hamiltonian(wfs, u, ham, psit_nG=None):
 
     """
 
-    # if psit_nG is None:
-    #     kpt = wfs.kpt_u[u]
-    #     psit_nG = kpt.psit_nG
-    # else:
-    #     kpt = wfs.kpt_u[u]
-    #     psit = kpt.psit.new()
-    #     psit.in_memory = False
-    #     psit.matrix.array = psit_nG.copy()
-    #     kpt.psit = psit
-
     kpt = wfs.kpt_u[u]
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
 
@@ -181,7 +173,32 @@ def apply_pseudo_hamiltonian(wfs, u, ham, psit_nG=None):
     
     # this function can only be used if we use GPAW's wfs
     # maybe we don't want to do that...
-    wfs.apply_pseudo_hamiltonian(kpt, ham, psit_nG, Htpsit_nG)
+    # The following is taken directly from GPAW,
+    # separating ham.xc.apply_orbital_dependent_hamiltonian
+    if not wfs.collinear:
+        wfs.apply_pseudo_hamiltonian_nc(kpt, ham, psit_nG, Htpsit_nG)
+        return
+
+    N = len(psit_nG)
+    S = wfs.gd.comm.size
+
+    vt_R = wfs.gd.collect(ham.vt_sG[kpt.s], broadcast=True)
+    Q_G = wfs.pd.Q_qG[kpt.q]
+    T_G = 0.5 * wfs.pd.G2_qG[kpt.q]
+
+    for n1 in range(0, N, S):
+        n2 = min(n1 + S, N)
+        psit_G = wfs.pd.alltoall1(psit_nG[n1:n2], kpt.q)
+        with wfs.timer('HMM T'):
+            np.multiply(T_G, psit_nG[n1:n2], Htpsit_nG[n1:n2])
+        if psit_G is not None:
+            psit_R = wfs.pd.ifft(psit_G, kpt.q, local=True, safe=False)
+            psit_R *= vt_R
+            wfs.pd.fftplan.execute()
+            vtpsit_G = wfs.pd.tmp_Q.ravel()[Q_G]
+        else:
+            vtpsit_G = wfs.pd.tmp_G
+        wfs.pd.alltoall2(vtpsit_G, kpt.q, Htpsit_nG[n1:n2])
 
     return Htpsit_nG
 
@@ -235,24 +252,97 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
 
     return dHpsit_nG
 
-def update_dens(dens, wfs):
-    dens.timer.start('Density')
-    with dens.timer('Pseudo density'):
-        dens.calculate_pseudo_density(wfs)
-    with dens.timer('Atomic density matrices'):
-        wfs.calculate_atomic_density_matrices(dens.D_asp)
-    with dens.timer('Multipole moments'):
-        comp_charge, _Q_aL = dens.calculate_multipole_moments()
+def apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None, cycle=-1):
+    '''
+    Apply Hamiltonian due to exact HF exchange:
+    The hamiltonian consist of both local and non-local part due to Vxx
+    This function is modified based on GPAW's function
+    '''
 
-    # if isinstance(wfs, LCAOWaveFunctions):
-    #     dens.timer.start('Normalize')
-    #     dens.normalize(comp_charge)
-    #     dens.timer.stop('Normalize')
+    kpt = wfs.kpt_u[u]
+    xc = ham.xc
 
-    # dens.timer.start('Mix')
-    dens.mix(comp_charge) # disable GPAW's DM
-    # dens.timer.stop('Mix')
-    dens.timer.stop('Density')
+    psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
+    Vxxpsit_nG = np.zeros_like(psit_nG)
+
+    if xc.coulomb is None:
+        xc.coulomb = coulomb_interaction(xc.omega, wfs.gd, wfs.kd)
+        xc.description += '\n' + xc.coulomb.get_description()
+        xc.sym = Symmetry(wfs.kd)
+
+    paw_s = calculate_paw_stuff(wfs, xc.dens)  # Calculates Vxx-paw corrections
+
+    if kpt.f_n is None:
+        # Just use LDA_X for first step:
+        if xc.vlda_sR is None:
+            # First time:
+            xc.vlda_sR = xc.calculate_lda_potential()
+        pd = kpt.psit.pd
+        for psit_G, Htpsit_G in zip(psit_nG, Vxxpsit_nG):
+            Htpsit_G += pd.fft(xc.vlda_sR[kpt.s] *
+                                pd.ifft(psit_G, kpt.k), kpt.q)
+    else:
+        xc.vlda_sR = None
+        
+        assert((kpt.s, kpt.k) in xc.v_sknG)
+        v_nG = xc.v_sknG.get(
+            (kpt.s, kpt.k),
+            apply2(kpt, psit_nG, Vxxpsit_nG, wfs,
+                    xc.coulomb, xc.sym,
+                    paw_s[kpt.s])
+        )
+        Vxxpsit_nG += v_nG * xc.exx_fraction
+
+    return Vxxpsit_nG
+
+def ACE(wfs, u, ham, psit_nG=None, cycle=-1):
+    '''
+    Adaptively Compressed Exchange operator
+    Input:  V_xxpsit_mG         -   [N_occ x N_pw matrix]
+    Output: V_ACE_xxpsit_nG     -   [Nao x N_pw matrix]
+    '''
+    kpt = wfs.kpt_u[u]
+    psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
+    psit_mG = kpt.psit_nG
+
+    V_xxpsit_mG = apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None, cycle=-1)
+
+    M_mm = np.inner(psit_mG.conj(), V_xxpsit_mG)
+    L_mm = np.linalg.cholesky(-M_mm)
+    xi_mG = np.linalg.inv(L_mm.conj()) @ V_xxpsit_mG
+    V_ACE_xxpsit_nG = -np.inner(psit_nG, xi_mG.conj()) @ xi_mG
+
+    return V_ACE_xxpsit_nG
+
+def apply_exact_exchange(wfs, u, ham, psit_nG=None, use_ACE=True):
+    psit_nG = wfs.kpt_u[u].psit_nG if psit_nG is None else psit_nG
+
+    if use_ACE:
+        Vxxpsit_nG = ACE(wfs, u, ham, psit_nG=psit_nG)
+    else:
+        assert(psit_nG.shape == wfs.kpt_u[u].psit_nG.shape)
+        Vxxpsit_nG = apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG)
+
+    return Vxxpsit_nG
+
+# def update_dens(dens, wfs):
+#     dens.timer.start('Density')
+#     with dens.timer('Pseudo density'):
+#         dens.calculate_pseudo_density(wfs)
+#     with dens.timer('Atomic density matrices'):
+#         wfs.calculate_atomic_density_matrices(dens.D_asp)
+#     with dens.timer('Multipole moments'):
+#         comp_charge, _Q_aL = dens.calculate_multipole_moments()
+
+#     # if isinstance(wfs, LCAOWaveFunctions):
+#     #     dens.timer.start('Normalize')
+#     #     dens.normalize(comp_charge)
+#     #     dens.timer.stop('Normalize')
+
+#     # dens.timer.start('Mix')
+#     dens.mix(comp_charge) # disable GPAW's DM
+#     # dens.timer.stop('Mix')
+#     dens.timer.stop('Density')
 
 def apply_to_single_u(ham, wfs, u):
     '''
@@ -268,12 +358,13 @@ def apply_to_single_u(ham, wfs, u):
 
 
 class PAWKRHF(KRHF):
-    def __init__(self, cell, calc,
+    def __init__(self, cell, calc, use_ACE=True,
                  kpts=np.zeros((1,3)),
                  exxdiv=getattr(__config__, 'pbc_scf_SCF_exxdiv', 'ewald')):
         super().__init__(cell, kpts, exxdiv)
         self.calc = calc        # GPAW calculator
         self.cell = cell
+        self.use_ACE = use_ACE
         self.nbands = calc.wfs.kpt_u[0].psit_nG.shape[0]
         
         # construct the basis transformation matrix from GTO to PW
@@ -361,11 +452,12 @@ class PAWKRHF(KRHF):
             dv = calc.wfs.kpt_u[k].psit.dv
             # recall each column of gto2pw[k] is PW coefficient of AO, gto2pw[k].shape = (N_PW, nao)
             psit_nG = self.gto2pw[k].T.copy()
-            Htpsit_nG = apply_pseudo_hamiltonian(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG).T
-            dHpsit_nG = apply_PAW_correction(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=True).T
-            Hpsit_nG = Htpsit_nG + dHpsit_nG    # H |psit_nG>.shape = (N_PW, nao)
+            Htpsit_nG = apply_pseudo_hamiltonian(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG)
+            dHpsit_nG = apply_PAW_correction(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=True)
+            Vxxpsit_nG = apply_exact_exchange(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG, use_ACE=self.use_ACE)
+            Hpsit_nG = Htpsit_nG + dHpsit_nG + Vxxpsit_nG    # H |psit_nG>.shape = (N_PW, nao)
             
-            h[k, :, :] = self.gto2pw[k].conj().T @ Hpsit_nG * dv
+            h[k, :, :] = Hpsit_nG @ self.gto2pw[k].conj() * dv
 
         return h
     
@@ -382,15 +474,10 @@ class PAWKRHF(KRHF):
         ham = self.calc.hamiltonian
 
         for k in range(len(mo_coeff_kpts)):
-            mo_coeff_pw = self.gto2pw[k] @ mo_coeff_kpts[k]
+            mo_coeff_pw = self.gto2pw[k] @ mo_coeff_kpts[k][:, :self.nbands]
             kpt = wfs.kpt_u[k]
 
             # update |psit>
-            # Caution: messing with memory big time
-            # psit = kpt.psit.new()
-            # psit.in_memory = False
-            # psit.matrix.array = mo_coeff_pw.T.copy()
-            # kpt.psit = psit
             psit = kpt.psit.new(buf=mo_coeff_pw.T)
             kpt.psit[:] = psit
             
@@ -463,7 +550,7 @@ class PAWKRHF(KRHF):
         # if vhf_kpts is None: vhf_kpts = mf.get_veff(mf.cell, dm_kpts)
         # f_kpts = h1e_kpts + vhf_kpts
         #############
-        f_kpts = self.get_h_matrix() 
+        f_kpts = self.get_h_matrix()
         #################
 
         if cycle < 0 and diis is None:  # Not inside the SCF iteration
@@ -507,8 +594,8 @@ class PAWKRHF(KRHF):
 
             # the copy is somehow necessary to avoid bug when doing integral in gpaw
             psit_nG = self.gto2pw[k].T.copy()
-            Spsit_nG = apply_overlap(calc.wfs, k, psit_nG=psit_nG).T
-            s[k, :, :] = self.gto2pw[k].conj().T @ Spsit_nG * dv
+            Spsit_nG = apply_overlap(calc.wfs, k, psit_nG=psit_nG)
+            s[k, :, :] = Spsit_nG @ self.gto2pw[k].conj() * dv
 
         return s
     
@@ -546,15 +633,40 @@ class PAWKRHF(KRHF):
         # wfs.eigensolver.iterate(ham, wfs)
 
         # EXX/Hybrid energy correction
-        if xc.type == 'HYB' and (kpt.s, kpt.k) not in xc.v_sknG:
-            assert not any(s == kpt.s for s, k in xc.v_sknG)
+        #
+        # working version
+        #
+        # if xc.type == 'HYB' and (kpt.s, kpt.k) not in xc.v_sknG:
+        #     assert not any(s == kpt.s for s, k in xc.v_sknG)
+        #     paw_s = calculate_paw_stuff(wfs, xc.dens)
+        #     evc, evv, ekin, _ = apply1(
+        #         kpt, None,
+        #         wfs,
+        #         xc.coulomb, xc.sym,
+        #         paw_s[kpt.s])
+        #     if kpt.s == 0:
+        #         xc.evc = 0.0
+        #         xc.evv = 0.0
+        #         xc.ekin = 0.0
+        #     scale = 2 / wfs.nspins * xc.exx_fraction
+        #     xc.evc += evc * scale
+        #     xc.evv += evv * scale
+        #     xc.ekin += ekin * scale
+        # #     xc.v_sknG = {(kpt.s, k): v_nG
+        # #                     for k, v_nG in v_knG.items()}
+        # # v_nG = xc.v_sknG.pop((kpt.s, kpt.k))
+
+        #
+        # testing version (TODO: also work for gamma point now)
+        #
+        if xc.type == 'HYB':
             paw_s = calculate_paw_stuff(wfs, xc.dens)
-            evc, evv, ekin, _ = apply1(
+            evc, evv, ekin, v_knG = apply1(
                 kpt, None,
                 wfs,
                 xc.coulomb, xc.sym,
                 paw_s[kpt.s])
-            if kpt.s == 0:
+            if kpt.s == 0: # TODO: always true for restricted calculation
                 xc.evc = 0.0
                 xc.evv = 0.0
                 xc.ekin = 0.0
@@ -562,9 +674,9 @@ class PAWKRHF(KRHF):
             xc.evc += evc * scale
             xc.evv += evv * scale
             xc.ekin += ekin * scale
-        #     xc.v_sknG = {(kpt.s, k): v_nG
-        #                     for k, v_nG in v_knG.items()}
-        # v_nG = xc.v_sknG.pop((kpt.s, kpt.k))
+            xc.v_sknG = {(kpt.s, k): v_nG
+                            for k, v_nG in v_knG.items()}
+
 
         # e_entropy = wfs.calculate_occupation_numbers(fix_fermi_level=False) ### !!
         e_entropy = 0 # TODO: True for ground state calculation
