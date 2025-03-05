@@ -252,7 +252,7 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
 
     return dHpsit_nG
 
-def apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None, cycle=-1):
+def apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None):
     '''
     Apply Hamiltonian due to exact HF exchange:
     The hamiltonian consist of both local and non-local part due to Vxx
@@ -295,7 +295,7 @@ def apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None, cycle=-1):
 
     return Vxxpsit_nG
 
-def ACE(wfs, u, ham, psit_nG=None, cycle=-1):
+def ACE(wfs, u, ham, psit_nG=None):
     '''
     Adaptively Compressed Exchange operator
     Input:  V_xxpsit_mG         -   [N_occ x N_pw matrix]
@@ -305,7 +305,7 @@ def ACE(wfs, u, ham, psit_nG=None, cycle=-1):
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
     psit_mG = kpt.psit_nG
 
-    V_xxpsit_mG = apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None, cycle=-1)
+    V_xxpsit_mG = apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None)
 
     M_mm = np.inner(psit_mG.conj(), V_xxpsit_mG)
     L_mm = np.linalg.cholesky(-M_mm)
@@ -314,7 +314,7 @@ def ACE(wfs, u, ham, psit_nG=None, cycle=-1):
 
     return V_ACE_xxpsit_nG
 
-def apply_exact_exchange(wfs, u, ham, psit_nG=None, use_ACE=True):
+def apply_exact_exchange(wfs, u, ham, use_ACE, psit_nG=None):
     psit_nG = wfs.kpt_u[u].psit_nG if psit_nG is None else psit_nG
 
     if use_ACE:
@@ -358,14 +358,14 @@ def apply_to_single_u(ham, wfs, u):
 
 
 class PAWKRHF(KRHF):
-    def __init__(self, cell, calc, use_ACE=True,
+    def __init__(self, cell, calc,
                  kpts=np.zeros((1,3)),
                  exxdiv=getattr(__config__, 'pbc_scf_SCF_exxdiv', 'ewald')):
         super().__init__(cell, kpts, exxdiv)
         self.calc = calc        # GPAW calculator
         self.cell = cell
-        self.use_ACE = use_ACE
         self.nbands = calc.wfs.kpt_u[0].psit_nG.shape[0]
+        self.use_ACE = True if self.nbands != cell.nao else False
         
         # construct the basis transformation matrix from GTO to PW
         t1 = time.time()
@@ -454,7 +454,7 @@ class PAWKRHF(KRHF):
             psit_nG = self.gto2pw[k].T.copy()
             Htpsit_nG = apply_pseudo_hamiltonian(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG)
             dHpsit_nG = apply_PAW_correction(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG, calculate_P_ani=True)
-            Vxxpsit_nG = apply_exact_exchange(calc.wfs, k, calc.hamiltonian, psit_nG=psit_nG, use_ACE=self.use_ACE)
+            Vxxpsit_nG = apply_exact_exchange(calc.wfs, k, calc.hamiltonian, self.use_ACE, psit_nG=psit_nG)
             Hpsit_nG = Htpsit_nG + dHpsit_nG + Vxxpsit_nG    # H |psit_nG>.shape = (N_PW, nao)
             
             h[k, :, :] = Hpsit_nG @ self.gto2pw[k].conj() * dv
