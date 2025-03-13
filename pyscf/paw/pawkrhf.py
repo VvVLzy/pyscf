@@ -1,7 +1,7 @@
 import time
 from copy import deepcopy
 
-import numpy as np
+import numpy
 
 from gpaw import GPAW, PW
 from gpaw.mixer import DummyMixer
@@ -34,19 +34,19 @@ def project_gpaw_to_AO(calc, cell, kpts, k=0):
     '''
     mesh = calc.wfs.gd.N_c
     nbands = calc.wfs.bd.nbands
-    psit_Rn = np.zeros((mesh.prod(), nbands), dtype=np.complex128)
+    psit_Rn = numpy.zeros((mesh.prod(), nbands), dtype=numpy.complex128)
     
     for i in range(nbands):
         # normalize psit_G
         psit_G = calc.wfs.kpt_u[0].psit_nG[i]
-        norm = np.linalg.norm(psit_G)
+        norm = numpy.linalg.norm(psit_G)
         psit_G /= norm
 
         # ifft to get real space rep
         psit_R = calc.wfs.pd.ifft(psit_G, q=k)
-        normalization = calc.wfs.gd.N_c.prod() / np.sqrt(calc.wfs.gd.volume)
+        normalization = calc.wfs.gd.N_c.prod() / numpy.sqrt(calc.wfs.gd.volume)
         psit_R *= normalization
-        norm = np.sum(psit_R.conj() * psit_R)*calc.wfs.gd.dv # normalized within u.c. indeed
+        norm = numpy.sum(psit_R.conj() * psit_R)*calc.wfs.gd.dv # normalized within u.c. indeed
         psit_Rn[:, i] = psit_R.reshape(-1, )
 
     
@@ -55,7 +55,7 @@ def project_gpaw_to_AO(calc, cell, kpts, k=0):
     c_nj = psit_Rn.T.conj() @ AO_Rj * calc.wfs.gd.dv
 
     from pyscf.pbc.scf.hf import get_ovlp
-    S_inv_ij = np.linalg.inv(get_ovlp(cell, kpts)[k])
+    S_inv_ij = numpy.linalg.inv(get_ovlp(cell, kpts)[k])
 
     P_nn = c_nj.conj() @ S_inv_ij @ c_nj.T
 
@@ -123,7 +123,7 @@ def apply_overlap(wfs, u, calculate_P_ani=True, psit_nG=None):
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
 
     # b_xG is the resulting expansion coefficient after applying S
-    Spsit_nG = np.copy(psit_nG)
+    Spsit_nG = numpy.copy(psit_nG)
 
     # (taken from GPAW)
     # random initialization of a dictionary with signature
@@ -143,7 +143,7 @@ def apply_overlap(wfs, u, calculate_P_ani=True, psit_nG=None):
         
 
     for a, P_ni in P_ani.items():
-        P_ani[a] = np.dot(P_ni, wfs.setups[a].dO_ii)
+        P_ani[a] = numpy.dot(P_ni, wfs.setups[a].dO_ii)
     wfs.pt.add(Spsit_nG, P_ani, kpt.q)  # b_xG += sum_ai pt^a_i P_ani
 
     return Spsit_nG
@@ -169,7 +169,7 @@ def apply_pseudo_hamiltonian(wfs, u, ham, psit_nG=None):
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
 
 
-    Htpsit_nG = np.zeros_like(psit_nG)
+    Htpsit_nG = numpy.zeros_like(psit_nG)
     
     # this function can only be used if we use GPAW's wfs
     # maybe we don't want to do that...
@@ -190,7 +190,7 @@ def apply_pseudo_hamiltonian(wfs, u, ham, psit_nG=None):
         n2 = min(n1 + S, N)
         psit_G = wfs.pd.alltoall1(psit_nG[n1:n2], kpt.q)
         with wfs.timer('HMM T'):
-            np.multiply(T_G, psit_nG[n1:n2], Htpsit_nG[n1:n2])
+            numpy.multiply(T_G, psit_nG[n1:n2], Htpsit_nG[n1:n2])
         if psit_G is not None:
             psit_R = wfs.pd.ifft(psit_G, kpt.q, local=True, safe=False)
             psit_R *= vt_R
@@ -230,7 +230,7 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
 
     # b_xG is the resulting expansion coefficient after applying dH
-    dHpsit_nG = np.zeros_like(psit_nG)
+    dHpsit_nG = numpy.zeros_like(psit_nG)
 
     # (taken from GPAW)
     # random initialization of a dictionary with signature
@@ -246,7 +246,7 @@ def apply_PAW_correction(wfs, u, ham, calculate_P_ani=True, psit_nG=None):
 
     for a, P_ni in P_ani.items():
         dH_ii = unpack_hermitian(ham.dH_asp[a][kpt.s])
-        P_ani[a] = np.dot(P_ni, dH_ii)
+        P_ani[a] = numpy.dot(P_ni, dH_ii)
 
     wfs.pt.add(dHpsit_nG, P_ani, kpt.q)
 
@@ -263,7 +263,7 @@ def apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None):
     xc = ham.xc
 
     psit_nG = kpt.psit_nG if psit_nG is None else psit_nG
-    Vxxpsit_nG = np.zeros_like(psit_nG)
+    Vxxpsit_nG = numpy.zeros_like(psit_nG)
 
     if xc.coulomb is None:
         xc.coulomb = coulomb_interaction(xc.omega, wfs.gd, wfs.kd)
@@ -307,14 +307,17 @@ def ACE(wfs, u, ham, psit_nG=None):
 
     V_xxpsit_mG = apply_orbital_dependent_hamiltonian(wfs, u, ham, psit_nG=None)
 
-    M_mm = np.inner(psit_mG.conj(), V_xxpsit_mG)
-    L_mm = np.linalg.cholesky(-M_mm)
-    xi_mG = np.linalg.inv(L_mm.conj()) @ V_xxpsit_mG
-    V_ACE_xxpsit_nG = -np.inner(psit_nG, xi_mG.conj()) @ xi_mG
+    M_mm = numpy.inner(psit_mG.conj(), V_xxpsit_mG)
+    L_mm = numpy.linalg.cholesky(-M_mm)
+    xi_mG = numpy.linalg.inv(L_mm.conj()) @ V_xxpsit_mG
+    V_ACE_xxpsit_nG = -numpy.inner(psit_nG, xi_mG.conj()) @ xi_mG
 
     return V_ACE_xxpsit_nG
 
 def apply_exact_exchange(wfs, u, ham, use_ACE, psit_nG=None):
+    if ham.xc.type != 'HYB':
+        return 0
+    
     psit_nG = wfs.kpt_u[u].psit_nG if psit_nG is None else psit_nG
 
     if use_ACE:
@@ -359,7 +362,7 @@ def apply_to_single_u(ham, wfs, u):
 
 class PAWKRHF(KRHF):
     def __init__(self, cell, calc,
-                 kpts=np.zeros((1,3)),
+                 kpts=numpy.zeros((1,3)),
                  exxdiv=getattr(__config__, 'pbc_scf_SCF_exxdiv', 'ewald')):
         super().__init__(cell, kpts, exxdiv)
         self.calc = calc        # GPAW calculator
@@ -396,8 +399,8 @@ class PAWKRHF(KRHF):
         self.aos_k = list()     # for verifying PW expansion is complete
         for k in range(len(self.kpts)):
             npw, nao = self.calc.wfs.ng_k[k], self.cell.nao
-            gto2pw_k = np.zeros((npw, nao), dtype=np.complex128)
-            ao_k = np.zeros((npw, nao), dtype=np.complex128)
+            gto2pw_k = numpy.zeros((npw, nao), dtype=numpy.complex128)
+            ao_k = numpy.zeros((npw, nao), dtype=numpy.complex128)
             for j in range(nao):
                 ao_1d = GTOs[k][:, j]
                 ao_3d = ao_1d.reshape(mesh)
@@ -408,11 +411,11 @@ class PAWKRHF(KRHF):
 
                 # normalized so that <psit | psit> = 1
                 # this is a good sanity check that the expansion is complete
-                ao_3d_k = ao_3d_k / ao_1d.shape[0]*np.sqrt(self.cell.vol)
+                ao_3d_k = ao_3d_k / ao_1d.shape[0]*numpy.sqrt(self.cell.vol)
                 ao_k[:, j] = ao_3d_k
 
                 # # normalized so that <psit | psit> * dv = 1
-                # ao_3d_k /= np.sqrt(dv) # normalize AOs will take care of it
+                # ao_3d_k /= numpy.sqrt(dv) # normalize AOs will take care of it
 
                 gto2pw_k[:, j] = ao_3d_k
             self.gto2pw.append(gto2pw_k)
@@ -431,13 +434,13 @@ class PAWKRHF(KRHF):
             assert(S[k].shape[0] == S[k].shape[1])
             for ao in range(S[k].shape[0]):
                 norm = S[k][ao, ao]
-                self.gto2pw[k][:, ao] /= np.sqrt(norm)
+                self.gto2pw[k][:, ao] /= numpy.sqrt(norm)
                 # self.calc.kpt_u[k].psit
 
         S_new = self.get_ovlp()
         for k in range(len(S_new)):
             for ao in range(S_new[k].shape[0]):
-                assert(np.isclose(S_new[k][ao, ao], 1))
+                assert(numpy.isclose(S_new[k][ao, ao], 1))
 
     def get_h_matrix(self):
         '''
@@ -446,7 +449,7 @@ class PAWKRHF(KRHF):
         nkpts = len(self.kpts)
         nao = self.cell.nao
         calc = self.calc
-        h = np.zeros((nkpts, nao, nao), dtype=np.complex128)
+        h = numpy.zeros((nkpts, nao, nao), dtype=numpy.complex128)
 
         for k in range(nkpts):
             dv = calc.wfs.kpt_u[k].psit.dv
@@ -491,7 +494,7 @@ class PAWKRHF(KRHF):
             kpt.f_n = mo_occ_kpts[k][:self.nbands].copy()
             kpt.eps_n = mo_energy_kpts[k][:self.nbands].copy()
 
-        wfs.fermi_levels = np.array([fermi])
+        wfs.fermi_levels = numpy.array([fermi])
 
         # update dens and ham
         # update_dens(dens, wfs)
@@ -508,11 +511,11 @@ class PAWKRHF(KRHF):
         nkpts = len(mo_energy_kpts)
         nocc = self.cell.tot_electrons(nkpts) // 2
 
-        mo_energy = np.sort(np.hstack(mo_energy_kpts))
+        mo_energy = numpy.sort(numpy.hstack(mo_energy_kpts))
         fermi = mo_energy[nocc-1]
         mo_occ_kpts = []
         for mo_e in mo_energy_kpts:
-            mo_occ_kpts.append((mo_e <= fermi).astype(np.double) * 2)
+            mo_occ_kpts.append((mo_e <= fermi).astype(numpy.double) * 2)
 
         if nocc < mo_energy.size:
             logger.info(self, 'HOMO = %.12g  LUMO = %.12g',
@@ -524,14 +527,14 @@ class PAWKRHF(KRHF):
             logger.info(self, 'HOMO = %.12g', mo_energy[nocc-1])
 
         if self.verbose >= logger.DEBUG:
-            np.set_printoptions(threshold=len(mo_energy))
+            numpy.set_printoptions(threshold=len(mo_energy))
             logger.debug(self, '     k-point                  mo_energy')
             for k,kpt in enumerate(self.cell.get_scaled_kpts(self.kpts)):
                 logger.debug(self, '  %2d (%6.3f %6.3f %6.3f)   %s %s',
                             k, kpt[0], kpt[1], kpt[2],
-                            np.sort(mo_energy_kpts[k][mo_occ_kpts[k]> 0]),
-                            np.sort(mo_energy_kpts[k][mo_occ_kpts[k]==0]))
-            np.set_printoptions(threshold=1000)
+                            numpy.sort(mo_energy_kpts[k][mo_occ_kpts[k]> 0]),
+                            numpy.sort(mo_energy_kpts[k][mo_occ_kpts[k]==0]))
+            numpy.set_printoptions(threshold=1000)
 
         #######################
         # Append script to communicate with the GPAW calculator
@@ -586,7 +589,7 @@ class PAWKRHF(KRHF):
         calc = self.calc
         nao = self.cell.nao
         nkpts = len(self.kpts)
-        s = np.zeros((nkpts, nao, nao), dtype=np.complex128)
+        s = numpy.zeros((nkpts, nao, nao), dtype=numpy.complex128)
         
         for k in range(nkpts):
             # GPAW normalization
@@ -608,8 +611,8 @@ class PAWKRHF(KRHF):
         # if vhf_kpts is None: vhf_kpts = mf.get_veff(mf.cell, dm_kpts)
 
         # nkpts = len(dm_kpts)
-        # e1 = 1./nkpts * np.einsum('kij,kji', dm_kpts, h1e_kpts)
-        # e_coul = 1./nkpts * np.einsum('kij,kji', dm_kpts, vhf_kpts) * 0.5
+        # e1 = 1./nkpts * numpy.einsum('kij,kji', dm_kpts, h1e_kpts)
+        # e_coul = 1./nkpts * numpy.einsum('kij,kji', dm_kpts, vhf_kpts) * 0.5
         # mf.scf_summary['e1'] = e1.real
         # mf.scf_summary['e2'] = e_coul.real
         # logger.debug(mf, 'E1 = %s  E_coul = %s', e1, e_coul)

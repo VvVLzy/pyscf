@@ -197,6 +197,12 @@ class _SmearingKSCF(mol_addons._SmearingSCF):
                                kpts.check_mo_occ_symmetry(mo_occ_kpts[1]))
             else:
                 mo_occ_kpts = kpts.check_mo_occ_symmetry(mo_occ_kpts)
+
+        #######################
+        # Append script to communicate with the GPAW calculator
+        #######################
+        self.update_calc(mo_coeff_kpts, mo_occ_kpts, mo_energy_kpts, fermi)
+        
         return mo_occ_kpts
 
     def get_grad(self, mo_coeff_kpts, mo_occ_kpts, fock=None):
